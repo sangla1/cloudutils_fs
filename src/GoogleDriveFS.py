@@ -264,7 +264,7 @@ class GoogleDriveFS(FS):
     
     def exists(self, path):
         try:
-            self.getinfo(path)
+            self._cloud_command("get_file_info", path = path)
             return True
         except:
             return False
