@@ -1,11 +1,13 @@
 import six
 from StringIO import StringIO
 import mimetypes
+import os
+import datetime
 
 # python filesystem imports
 from fs.base import FS
 from fs.errors import PathError, UnsupportedError, \
-                      ResourceInvalidError, \
+                      CreateFailedError, ResourceInvalidError, \
                       ResourceNotFoundError, NoPathURLError
 from fs.remote import RemoteFileBuffer
 from fs.filelike import LimitBytesFile
@@ -14,12 +16,18 @@ from fs.filelike import LimitBytesFile
 import httplib2
 from apiclient.discovery import build
 from apiclient.http import MediaInMemoryUpload
+from oauth2client.client import OAuth2Credentials
 
 
 
 class GoogleDriveFS(FS):
     """
         Google drive file system
+        
+        
+        
+        @attention: when setting variables in os.environ please note that 
+            GD_TOKEN_EXPIRY has to be in format: "%Y, %m, %d, %H, %M, %S, %f"
     """
     
     _meta = { 'thread_safe' : True,
@@ -41,18 +49,37 @@ class GoogleDriveFS(FS):
         self.cached_files = {}
         self._cacheing = caching
         
+        def _getDateTimeFromString(time):
+            if time:
+                return datetime.datetime.strptime( time, "%Y, %m, %d, %H, %M, %S, %f" )
+            else:
+                return None            
+        
+        if( self._credentials == None ):
+            if( "GD_ACCESS_TOKEN" not in os.environ or
+                "GD_CLIENT_ID" not in os.environ or
+                "GD_CLIENT_SECRET" not in os.environ or
+                "GD_TOKEN_EXPIRY" not in os.environ or
+                "GD_TOKEN_URI" not in os.environ):
+                raise CreateFailedError("You need to set:\n" + \
+                                         "GD_ACCESS_TOKEN, GD_CLIENT_ID, GD_CLIENT_SECRET" + \
+                                         " GD_TOKEN_EXPIRY, GD_TOKEN_URI in os.environ")
+            else:
+                credentials = OAuth2Credentials(
+                                os.environ.get('GD_ACCESS_TOKEN'), 
+                                os.environ.get('GD_CLIENT_ID'), 
+                                os.environ.get('GD_CLIENT_SECRET'), 
+                                None, 
+                                _getDateTimeFromString( os.environ.get('GD_TOKEN_EXPIRY') ),
+                                os.environ.get('GD_TOKEN_URI'), 
+                                None
+                                )
+        
+                
         if (self._root == None):
             service = self._build_service(self._credentials)
             about = service.about().get().execute()
             self._root = about.get("rootFolderId")
-        
-        """
-        if( self._credentials == None ):
-            if( "DROPBOX_ACCESS_TOKEN" not in os.environ ):
-                raise CreateFailedError("DROPBOX_ACCESS_TOKEN is not set in os.environ")
-            else:
-                self._credentials['access_token'] = os.environ.get('DROPBOX_ACCESS_TOKEN')
-        """
             
         super(GoogleDriveFS, self).__init__(thread_synchronize=thread_synchronize)
 
@@ -170,6 +197,39 @@ class GoogleDriveFS(FS):
             return True
         else:
             return False
+        
+        
+    
+    def copy(self, src, dst, overwrite=False, chunk_size=1024 * 64):
+        """
+        @param src: Id of the file to be copied
+        @param dst: Id of the folder in which to copy the file
+        """
+        if( self.isdir(src) ):
+            raise PathError("Specified src is a directory. Please use copydir.")
+        
+        
+        self._copy(src, dst)
+    
+    def copydir(self, src, dst, overwrite=False, ignore_errors=False, chunk_size=16384):
+        """
+        @attention: Google drive doesn't support copy of folders. And to implement it 
+            over copy method will be very inefficient 
+        """
+        
+        raise NotImplemented("If implemented method will be very inefficient")
+    
+    
+    def _copy(self, src, dst):
+        src_info = self.exists(src)
+        if( not src_info ):
+            raise PathError("Specified src doesn't exist")
+        
+        if( not self.isdir(dst) ):
+            raise PathError("Specified dst is not a folder")
+        
+        return self._cloud_command("copy_file", src=src, dst=dst)
+    
     def rename(self, src, dst):
         """
         @param src: id of the file to be renamed 
@@ -190,7 +250,7 @@ class GoogleDriveFS(FS):
         if self.is_root(path = path):
             raise UnsupportedError("Can't remove the root directory")   
         if self.isdir(path = path):
-            raise PathError("Specified path is a directory")  
+            raise PathError("Specified path is a directory. Please use removedir.")  
 
         return self._cloud_command('file_delete', path=path)
     
@@ -242,16 +302,66 @@ class GoogleDriveFS(FS):
             else:
                 title = parts[1]
             self._cloud_command("file_create_folder", parent_id=parent_id, title=title)
-                   
-
     
+    def move(self, src, dst, overwrite=False, chunk_size=16384):
+        """
+        @param src: id of the file to be moved
+        @param dst: id of the folder in which the file will be moved
+        @param overwrite: for Google drive it is always false
+        @param chunk_size: if using chunk upload
+        
+        @note: google drive can have many parents for one file, when using this 
+            method a file will be moved from all current parents to the new 
+            parent 'dst'
+        """ 
+        if( self.isdir(src) ):
+            raise PathError("Specified src is a directory. Please use movedir.")
+        self._move(src, dst)
+    
+    def movedir(self, src, dst, overwrite=False, ignore_errors=False, chunk_size=16384):
+        """
+        @param src: id of the folder to be moved
+        @param dst: id of the folder in which the file will be moved
+        @param overwrite: for Google drive it is always false
+        @param chunk_size: if using chunk upload
+        
+        @note: google drive can have many parents for one folder, when using this 
+            method a folder will be moved from all current parents to the new 
+            parent 'dst'
+        """  
+        if( self.isfile(src) ):
+            raise PathError("Specified src is a file. Please use move.")
+        self._move(src, dst)
+    
+    def _move(self, src, dst):
+        src_info = self.exists(src)
+        dst_info = self.exists(dst)       
+             
+        if( not ( src_info or dst_info ) ):
+            raise PathError("Source or destination don't exist")
+        if( self._isfile(dst_info) ):
+            raise PathError("Specified destination is not a folder")
+
+        src_info['parents'] = [{"id": dst}]
+        self._cloud_command("update_file_info", path=src, new_file=src_info)
+        
+    def _isdir(self, info):
+        return info["mimeType"] == "application/vnd.google-apps.folder"
+        
     def isdir(self, path):
+        if( path == "/" ):
+            path = self._root
+            return True
         try:
             info = self.getinfo(path)
         except:           
             raise PathError(path)
         
-        return info["mimeType"] == "application/vnd.google-apps.folder"
+        return self._isdir(info)
+
+    
+    def _isfile(self, info):
+        return info["mimeType"] != "application/vnd.google-apps.folder"
     
     def isfile(self, path):
         try:
@@ -259,13 +369,12 @@ class GoogleDriveFS(FS):
         except:           
             raise PathError(path)
         
-        return info["mimeType"] != "application/vnd.google-apps.folder"
-
+        self._isfile(info)
+    
     
     def exists(self, path):
         try:
-            self._cloud_command("get_file_info", path = path)
-            return True
+            return self._cloud_command("get_file_info", path = path)
         except:
             return False
     
@@ -286,16 +395,15 @@ class GoogleDriveFS(FS):
                       files_only=False,
                       overrideCache=False
                       ):
-        if( not path ):
+        if( not path or path == "/" ):
             path = self._root
-        
         data = self._cloud_command('list_dir', path=path )
         flist = self._get_dir_list_from_service( data )
 
         dirContent = self._listdir_helper('', flist, wildcard, full, absolute, dirs_only, files_only)
         return dirContent
     
-    #Optimised listdir from pyfs
+
     def listdirinfo(self, path=None,
                           wildcard=None,
                           full=False,
@@ -335,8 +443,7 @@ class GoogleDriveFS(FS):
         @param path: file id for which to return informations
         @return: dictionary with informations about the specific file 
         @raise PathError: if the provided path doesn't exist 
-        """
-        
+        """        
         if(not self.exists(path)):
             raise PathError("Specified path doesn't exist")
         
@@ -351,7 +458,7 @@ class GoogleDriveFS(FS):
         then a :class:`~fs.errors.NoPathURLError` exception is thrown. Otherwise the URL will be
         returns as an unicode string.
         
-        @param path: a path within the filesystem
+        @param path: id of the file for which to return the url path
         @param allow_none: if true, this method can return None if there is no
             URL form of the given path
         @type allow_none: bool
@@ -381,6 +488,14 @@ class GoogleDriveFS(FS):
         path = kwargs.get('path', self._root)
         service = self._build_service(self._credentials)
         
+        # This is needed for browse, and some parts of pyfs
+        # because it always puts / on the begining
+        if( path[0] == "/" ):
+            path = path[1:]
+        if( len(path) == 0 ):
+            path = self._root
+        
+        
         if cmd == 'list_dir':
             # Return directory list
             resp = service.children().list(folderId=path).execute()
@@ -398,7 +513,6 @@ class GoogleDriveFS(FS):
             else:
                 f = self.cached_files[path]
                 
-            
             download_url = f.get('downloadUrl')
             resp, content = service._http.request(download_url)
             if( resp.status == 200 ):
@@ -439,12 +553,17 @@ class GoogleDriveFS(FS):
             resp = service.files().delete(fileId=path).execute()
             # Return empty body if everything was OK
             return resp
-        elif cmd == 'file_move':
-            from_path = kwargs.get('from_path','')
-            to_path = kwargs.get('to_path','') 
-        
-            resp = self.client.file_move(from_path, to_path)
-            return resp 
+        elif cmd == 'copy_file':
+            source_id = kwargs.get('src','')
+            parent_id = kwargs.get('dst','') 
+            
+            body = {"parents": [{"id": parent_id}]}
+            
+            return service.files().copy(
+                                        fileId = source_id,
+                                        body = body
+                                        ).execute()
+            
         elif cmd == 'file_rename':
             file_id = kwargs.get('file_id','')
             title = kwargs.get('title','untitled') 
@@ -471,6 +590,17 @@ class GoogleDriveFS(FS):
                                                   fileId = path,
                                                   body = f,
                                                   media_body=media_body
+                                                  ).execute()
+            if(self._cacheing):
+                self.cached_files[path] = updated_file
+            return updated_file
+        elif cmd == 'update_file_info':
+            # Updates a file on google drive
+            f = kwargs.get("new_file")
+            updated_file = service.files().patch(
+                                                  fileId = path,
+                                                  body = f,
+                                                  fields="parents"
                                                   ).execute()
             if(self._cacheing):
                 self.cached_files[path] = updated_file

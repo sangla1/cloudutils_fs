@@ -1,26 +1,22 @@
 from skydrive import api_v5
 import six
 from StringIO import StringIO
-import mimetypes
+import os
 
 # python filesystem imports
 from fs.base import FS
 from fs.errors import PathError, UnsupportedError, \
-                      ResourceInvalidError, \
+                      CreateFailedError, ResourceInvalidError, \
                       ResourceNotFoundError, NoPathURLError
 from fs.remote import RemoteFileBuffer
 from fs.filelike import LimitBytesFile
 
-# Imports specific to google drive service
-import httplib2
-from apiclient.discovery import build
-from apiclient.http import MediaInMemoryUpload
 
 
 
 class SkyDriveFS(FS):
     """
-        Google drive file system
+        Sky drive file system
     """
     
     _meta = { 'thread_safe' : True,
@@ -36,26 +32,28 @@ class SkyDriveFS(FS):
               'atomic.setconetns' : True
               }
 
-    def __init__(self, root=None, credentials=None, thread_synchronize=True, caching=False):
+    def __init__(self, root=None, credentials=None, thread_synchronize=True, caching=False, 
+                 scope=["wl.skydrive_update"]):
         self._root = root
         self._credentials = credentials
         self.cached_files = {}
         self._cacheing = caching
         self._skydrive = api_v5.SkyDriveAPI()
         
-        self._skydrive.auth_access_token = credentials["access_token"]
+        
         
         if (self._root == None):
             self._root = "me/skydrive"
         
-        """
+        
         if( self._credentials == None ):
-            if( "DROPBOX_ACCESS_TOKEN" not in os.environ ):
-                raise CreateFailedError("DROPBOX_ACCESS_TOKEN is not set in os.environ")
+            if( "SKYDRIVE_ACCESS_TOKEN" not in os.environ ):
+                raise CreateFailedError("SKYDRIVE_ACCESS_TOKEN is not set in os.environ")
             else:
                 self._credentials['access_token'] = os.environ.get('DROPBOX_ACCESS_TOKEN')
-        """
-            
+        
+        self._skydrive.auth_scope = scope
+        self._skydrive.auth_access_token = credentials["access_token"]    
         super(SkyDriveFS, self).__init__(thread_synchronize=thread_synchronize)
 
         
@@ -241,7 +239,33 @@ class SkyDriveFS(FS):
             else:
                 title = parts[1]
             return self._skydrive.mkdir(title, parent_id)       
-
+    
+    def move(self, src, dst, overwrite=False, chunk_size=16384):
+        """
+        @param src: id of the file to be moved
+        @param dst: id of the folder in which the file will be moved
+        @param overwrite: for SkyDrive it is always false
+        @param chunk_size: if using chunk upload
+        
+        @note: folder can't be moved, this is a limitation of skydrive API 
+        """
+        
+        if( not (self.exists(src) or self.exists(dst)) ):
+            raise PathError("Source or destination don't exist")
+        
+        if( self.isdir(src) ):
+            raise UnsupportedError("move a directory")
+        
+        if( self.isfile(dst) ):
+            raise PathError("Specified destination is not a folder")
+        
+        self._skydrive.move(src, dst)
+    
+    def movedir(self, src, dst, overwrite=False, ignore_errors=False, chunk_size=16384):
+        """
+        @attention: skydrive API doesn't allow to move folders
+        """
+        raise UnsupportedError("move a directory")   
     
     def isdir(self, path):
         """
@@ -266,8 +290,7 @@ class SkyDriveFS(FS):
     
     def exists(self, path):
         try:
-            self._skydrive.info(path)
-            return True
+            return self._skydrive.info(path)
         except:
             return False
     
