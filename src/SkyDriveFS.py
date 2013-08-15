@@ -144,7 +144,7 @@ class SkyDriveFS(FS):
             self._update(path, "")
         else:
             try:
-                file_content.write( self._cloud_command("get_file", path=path ) )
+                file_content.write( self._skydrive.get(path) )
                 file_content.seek(0, 0)
             except Exception, e:
                 if "w" not in mode and "a" not in mode:
@@ -244,21 +244,25 @@ class SkyDriveFS(FS):
 
     
     def isdir(self, path):
-        try:
-            info = self.getinfo(path)
-        except:           
-            raise PathError(path)
+        """
+        Checks if the given path is a folder
         
-        return info["type"] == "folder"
+        @param path: id of the object to check
+        @attention: this method doesn't check if the given path exists
+            it will return true or false even if the file/folder doesn't exist
+        """
+        return "folder" in path
     
     def isfile(self, path):
-        try:
-            info = self.getinfo(path)
-        except:           
-            raise PathError(path)
+        """
+        Checks if the given path is a file
         
-        return info["type"] != "folder"
-
+        @param path: id of the object to check 
+        @attention: this method doesn't check if the given path exists
+            it will return true or false even if the file/folder doesn't exist
+        """
+        return "file" in path
+    
     
     def exists(self, path):
         try:
@@ -270,9 +274,8 @@ class SkyDriveFS(FS):
     
     def _get_dir_list_from_service(self, metadata):
         flist = []
-        if metadata and metadata.has_key('items'):
-            for one in metadata['items']:
-                flist.append(one['id'])
+        for one in metadata:
+            flist.append(one['id'])
                 
         return flist 
     
@@ -287,7 +290,7 @@ class SkyDriveFS(FS):
         if( not path ):
             path = self._root
         
-        data = self._cloud_command('list_dir', path=path )
+        data = self._skydrive.listdir(path)
         flist = self._get_dir_list_from_service( data )
 
         dirContent = self._listdir_helper('', flist, wildcard, full, absolute, dirs_only, files_only)
@@ -304,14 +307,12 @@ class SkyDriveFS(FS):
         if( not path ):
             path = self._root
         
-        metadata = self._cloud_command('list_dir_with_info', path=path)
+        metadata = self._skydrive.listdir(path)
         
         def getinfo(p):
-            if( metadata.has_key('items') ):
-                contents = metadata['items']
-                for one in contents:
-                    if( one['id'] == p ):
-                        return one
+            for one in metadata:
+                if( one['id'] == p ):
+                    return one
              
             return {}   
 
@@ -323,10 +324,6 @@ class SkyDriveFS(FS):
                                           dirs_only=dirs_only,
                                           files_only=files_only)]
 
-        
-        
-
-            
 
     def getinfo(self, path):
         """
@@ -349,7 +346,7 @@ class SkyDriveFS(FS):
         then a :class:`~fs.errors.NoPathURLError` exception is thrown. Otherwise the URL will be
         returns as an unicode string.
         
-        @param path: a path within the filesystem
+        @param path: object id for which to return url path
         @param allow_none: if true, this method can return None if there is no
             URL form of the given path
         @type allow_none: bool
@@ -360,123 +357,14 @@ class SkyDriveFS(FS):
         
         url = None
         try:
-            url = self.getinfo(path)
-            url = url["webContentLink"]
+            url = self.getinfo(path)['source']
         except:
             if not allow_none:
                 raise NoPathURLError(path=path)
 
         return url
     
-    
-    def _build_service(self, credentials):
-        http = httplib2.Http()
-        http = credentials.authorize(http);
-        service = build('drive', 'v2', http=http)
-        return service
-        
-    def _cloud_command(self, cmd, **kwargs):
-        path = kwargs.get('path', self._root)
-        service = self._build_service(self._credentials)
-        
-        if cmd == 'list_dir':
-            # Return directory list
-            resp = service.children().list(folderId=path).execute()
-            return resp
-        elif cmd == 'list_dir_with_info':
-            # Return directory list
-            param = {"q":  "'%s' in parents" % path}
-            resp = service.files().list(**param).execute()
-            return resp
-        elif cmd == 'get_file':
-            if( not self.cached_files.has_key(path) ): 
-                f = service.files().get(fileId=path).execute()
-                if(self._cacheing):
-                    self.cached_files[f["id"]] = f
-            else:
-                f = self.cached_files[path]
-                
-            
-            download_url = f.get('downloadUrl')
-            resp, content = service._http.request(download_url)
-            if( resp.status == 200 ):
-                return content
-            else:
-                return None   
-        elif cmd == 'get_file_info':
-            f = service.files().get(fileId=path).execute()
-            return f  
-        elif cmd == 'create_new_file':
-            title = kwargs.get("title", "untitled.txt")
-            parent_id = kwargs.get("parent_id", self._root)
-            description = kwargs.get("description", "")
-            body = {
-                    "title": title,
-                    "parents": [{"id": parent_id}],
-                    "description": description,
-                    "mimeType": mimetypes.guess_type(title)
-                    }
-            f = service.files().insert(
-                                       body = body
-                                       ).execute()
 
-            return f 
-        elif cmd == 'file_create_folder':
-            # Creates a new empty directory
-            parent_id = kwargs.get("parent_id", self._root)
-            title = kwargs.get("title", "untitled")
-            body = {
-                    "title": title,
-                    "parents": [{"id": parent_id}],
-                    "mimeType": "application/vnd.google-apps.folder"
-                    }
-            resp = service.files().insert(body=body).execute()
-            return resp
-        elif cmd == 'file_delete':
-            # Deletes file
-            resp = service.files().delete(fileId=path).execute()
-            # Return empty body if everything was OK
-            return resp
-        elif cmd == 'file_move':
-            from_path = kwargs.get('from_path','')
-            to_path = kwargs.get('to_path','') 
-        
-            resp = self.client.file_move(from_path, to_path)
-            return resp 
-        elif cmd == 'file_rename':
-            file_id = kwargs.get('file_id','')
-            title = kwargs.get('title','untitled') 
-            f = self.cached_files.get(path, None)
-
-            if( f == None ):
-                f = service.files().get(fileId=file_id).execute()
-            
-            f['title'] = title    
-            updated_file = service.files().update( fileId = file_id,
-                                                   body = f
-                                                  ).execute()
-            if(self._cacheing):                                      
-                self.cached_files[path] = updated_file
-            return updated_file        
-        elif cmd == 'update_file':
-            # Updates a file on google drive
-            f = self.cached_files.get(path, None)
-            if( f == None ):
-                f = service.files().get(fileId=path).execute()
-            content = kwargs.get("content")
-            media_body = MediaInMemoryUpload(content)
-            updated_file = service.files().update(
-                                                  fileId = path,
-                                                  body = f,
-                                                  media_body=media_body
-                                                  ).execute()
-            if(self._cacheing):
-                self.cached_files[path] = updated_file
-            return updated_file
-        return None
-    
-    
-    
 """
 Problems:
   - Flush and close, both call write contents and because of that 
