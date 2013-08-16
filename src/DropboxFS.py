@@ -1,40 +1,265 @@
+"""
+fs.contrib.dropboxfs
+========
+
+A FS object that integrates with Dropbox.
+
+"""
 import os
-import six
-from StringIO import StringIO
-
-# python filesystem imports
-from fs.base import FS
-from fs.path import normpath
-from fs.errors import PathError, UnsupportedError, \
-                      CreateFailedError, ResourceInvalidError, \
-                      ResourceNotFoundError, NoPathURLError
+import time
+import datetime
+import calendar
+from UserDict import UserDict
+from fs.base import *
+from fs.path import *
+from fs.errors import *
 from fs.remote import RemoteFileBuffer
-from fs.filelike import LimitBytesFile
+from fs.filelike import SpooledTemporaryFile
+
+from dropbox import rest
+from dropbox import client
+
+# Items in cache are considered expired after 5 minutes.
+CACHE_TTL = 300
+# The format Dropbox uses for times.
+TIME_FORMAT = '%a, %d %b %Y %H:%M:%S +0000'
+# Max size for spooling to memory before using disk (5M).
+MAX_BUFFER = 1024**2*5
 
 
-#Dropbox specific imports
-import dropbox
+class CacheItem(object):
+    """Represents a path in the cache. There are two components to a path.
+       It's individual metadata, and the children contained within it."""
+    def __init__(self, metadata=None, children=None, timestamp=None):
+        self.metadata = metadata
+        self.children = children
+        if timestamp is None:
+            timestamp = time.time()
+        self.timestamp = timestamp
+
+    def add_child(self, name):
+        if self.children is None:
+            self.children = [name]
+        else:
+            self.children.append(name)
+
+    def del_child(self, name):
+        if self.children is None:
+            return
+        try:
+            i = self.children.index(name)
+        except ValueError:
+            return
+        self.children.pop(i)
+
+    def _get_expired(self):
+        if self.timestamp <= time.time() - CACHE_TTL:
+            return True
+    expired = property(_get_expired)
+
+    def renew(self):
+        self.timestamp = time.time()
+
+
+class DropboxCache(UserDict):
+    def set(self, path, metadata):
+        self[path] = CacheItem(metadata)
+        dname, bname = pathsplit(path)
+        item = self.get(dname)
+        if item:
+            item.add_child(bname)
+
+    def pop(self, path, default=None):
+        value = UserDict.pop(self, path, default)
+        dname, bname = pathsplit(path)
+        item = self.get(dname)
+        if item:
+            item.del_child(bname)
+        return value
+
+
+class DropboxClient(client.DropboxClient):
+    """A wrapper around the official DropboxClient. This wrapper performs
+         caching as well as converting errors to fs exceptions."""
+    def __init__(self, *args, **kwargs):
+        super(DropboxClient, self).__init__(*args, **kwargs)
+        self.cache = DropboxCache()
+
+    # Below we split the DropboxClient metadata() method into two methods
+    # metadata() and children(). This allows for more fine-grained fetches
+    # and caching.
+
+    def metadata(self, path):
+        "Gets metadata for a given path."
+        item = self.cache.get(path)
+        if not item or item.metadata is None or item.expired:
+            try:
+                metadata = super(DropboxClient, self).metadata(path,
+                    include_deleted=False, list=False)
+            except rest.ErrorResponse, e:
+                if e.status == 404:
+                    raise ResourceNotFoundError(path)
+                raise RemoteConnectionError(opname='metadata', path=path,
+                                            errno=e.status)
+            if metadata.get('is_deleted', False):
+                raise ResourceNotFoundError(path)
+            item = self.cache[path] = CacheItem(metadata)
+        # Copy the info so the caller cannot affect our cache.
+        return dict(item.metadata.items())
+
+    def children(self, path):
+        "Gets children of a given path."
+        update, hash = False, None
+        item = self.cache.get(path)
+        if item:
+            if item.expired:
+                update = True
+                if item.metadata and item.children:
+                    hash = item.metadata['hash']
+            else:
+                if not item.metadata.get('is_dir'):
+                    raise ResourceInvalidError(path)
+            if not item.children:
+                update = True
+        else:
+            update = True
+        if update:
+            try:
+                metadata = super(DropboxClient, self).metadata(path, hash=hash,
+                    include_deleted=False, list=True)
+                children = []
+                contents = metadata.pop('contents')
+                for child in contents:
+                    if child.get('is_deleted', False):
+                        continue
+                    children.append(basename(child['path']))
+                    self.cache[child['path']] = CacheItem(child)
+                item = self.cache[path] = CacheItem(metadata, children)
+            except rest.ErrorResponse, e:
+                if not item or e.status != 304:
+                    raise RemoteConnectionError(opname='metadata', path=path,
+                                                errno=e.status)
+                # We have an item from cache (perhaps expired), but it's
+                # hash is still valid (as far as Dropbox is concerned),
+                # so just renew it and keep using it.
+                item.renew()
+        return item.children
+
+    def file_create_folder(self, path):
+        "Add newly created directory to cache."
+        try:
+            metadata = super(DropboxClient, self).file_create_folder(path)
+        except rest.ErrorResponse, e:
+            if e.status == 404:
+                raise ParentDirectoryMissingError(path)
+            if e.status == 403:
+                raise DestinationExistsError(path)
+            raise RemoteConnectionError(opname='file_create_folder', path=path,
+                                        errno=e.status)
+        self.cache.set(path, metadata)
+
+    def file_copy(self, src, dst):
+        try:
+            metadata = super(DropboxClient, self).file_copy(src, dst)
+        except rest.ErrorResponse, e:
+            if e.status == 404:
+                raise ResourceNotFoundError(src)
+            if e.status == 403:
+                raise DestinationExistsError(dst)
+            raise RemoteConnectionError(opname='file_copy',
+                                        errno=e.status)
+        self.cache.set(dst, metadata)
+
+    def file_move(self, src, dst):
+        try:
+            metadata = super(DropboxClient, self).file_move(src, dst)
+        except rest.ErrorResponse, e:
+            if e.status == 404:
+                raise ResourceNotFoundError(src)
+            if e.status == 403:
+                raise DestinationExistsError(dst)
+            raise RemoteConnectionError(opname='file_move',
+                                        errno=e.status)
+        self.cache.pop(src, None)
+        self.cache.set(dst, metadata)
+
+    def file_delete(self, path):
+        try:
+            super(DropboxClient, self).file_delete(path)
+        except rest.ErrorResponse, e:
+            if e.status == 404:
+                raise ResourceNotFoundError(path)
+            if e.status == 400 and 'must not be empty' in str(e):
+                raise DirectoryNotEmptyError(path)
+            raise
+        self.cache.pop(path, None)
+
+    def put_file(self, path, f, overwrite=False):
+        try:
+            super(DropboxClient, self).put_file(path, f, overwrite=overwrite)
+        except rest.ErrorResponse, e:
+            raise RemoteConnectionError(opname='put_file', path=path,
+                                        errno=e.status)
+        except TypeError, e:
+            raise OperationFailedError("put_file", path, msg="Provided data is of the wrong type")
+        self.cache.pop(dirname(path), None)
+
+            
+    def media(self, path):
+        try:
+            info = super(DropboxClient, self).media( path )
+            return info.get('url', None) 
+        except rest.ErrorResponse, e:
+            if e.status == 400:
+                raise UnsupportedError("create a link to a folder")
+            if e.status == 404:
+                raise ResourceNotFoundError(path)
+            
+            raise RemoteConnectionError(opname='metadata', path=path,
+                                        errno=e.status)
+
+
+
+def metadata_to_info(metadata, localtime=False):
+    isdir = metadata.pop('is_dir', False)
+    info = {
+        'size': metadata.pop('bytes', 0),
+        'isdir': isdir,
+        'isfile': not isdir,
+    }
+    try:
+        mtime = metadata.pop('modified', None)
+        if mtime:
+            # Parse date/time from Dropbox as struct_time.
+            mtime = time.strptime(mtime, TIME_FORMAT)
+            if localtime:
+                # Convert time to local timezone in seconds.
+                mtime = calendar.timegm(mtime)
+            else:
+                mtime = time.mktime(mtime)
+            # Convert to datetime object, store in modified_time
+            info['modified_time'] = datetime.datetime.fromtimestamp(mtime)
+    except KeyError:
+        pass
+    return info
 
 
 class DropboxFS(FS):
-    """
-        TODO: Description
-    """
-    
+    """A FileSystem that stores data in Dropbox."""
+
     _meta = { 'thread_safe' : True,
-              'virtual': False,
+              'virtual' : False,
               'read_only' : False,
               'unicode_paths' : True,
-              'case_insensitive_paths' : False,
+              'case_insensitive_paths' : True,
               'network' : True,
-              'atomic.move' : True,
-              'atomic.copy' : True,
-              'atomic.makedir' : True,
-              'atomic.rename' : False,
-              'atomic.setconetns' : True
-              }
+              'atomic.setcontents' : True,
+              'atomic.makedir': True,
+              'atomic.rename': True,
+              'mime_type': 'virtual/dropbox',
+             }
 
-    def __init__(self, root=None, credentials=None, thread_synchronize=True):
+    def __init__(self, root=None, credentials=None, localtime=False, thread_synchronize=True):
         self._root = root
         self._credentials = credentials
         
@@ -44,330 +269,152 @@ class DropboxFS(FS):
             else:
                 self._credentials['access_token'] = os.environ.get('DROPBOX_ACCESS_TOKEN')
         
-            
         super(DropboxFS, self).__init__(thread_synchronize=thread_synchronize)
-    
-    
-    
-    def __repr__(self):
-        args = (self.__class__.__name__, self._root)
-        
-        return 'FileSystem: %s \nRoot: %s' % args
+        self.client = DropboxClient( oauth2_access_token = self._credentials['access_token'] )
+        self.localtime = localtime
 
-    __str__ = __repr__
+    def __str__(self):
+        return "<DropboxFS: %s>" % self._root
+
+    def __unicode__(self):
+        return u"<DropboxFS: %s>" % self._root
+
+    def getmeta(self, meta_name, default=NoDefaultMeta):
+        if meta_name == 'read_only':
+            return self.read_only
+        return super(DropboxFS, self).getmeta(meta_name, default)
     
-    
-    def _upload(self, path, data):
-        if isinstance(data, basestring):
-            string_data = data
+    def is_root(self, path):
+        if( path == self._root):
+            return True
         else:
-            try:
-                data.seek(0)
-                string_data = data.read()
-            except:
-                raise ResourceInvalidError("Unsupported type")
-            
-        
-        return self._cloud_command("put_file", path=path, data=string_data, overwrite=True)
+            return False
     
-    def setcontents(self, path, data="", encoding=None, errors=None, chunk_size=64*1024):
-        """
-        Sets contents to remote file.
-        @param path: Full path to the file.
-        @param data: File content as a string, or a StringIO object
-        """ 
-        if isinstance(data, six.text_type):
-            data = data.encode(encoding=encoding, errors=errors)
-
-        self._upload(path, data)
     
-    def createfile(self, path, wipe=False):
-        """Creates an empty file if it doesn't exist
-        
-        @param path: path to the file to create
-        @param wipe: if True, existing file will be overwritten and it's contents will be erased
-        @raise PathError: If the existing path is not valid. The reasons could be:
-            provided path is the root path
-            provided path is an existing file an wipe is set to False
-        @raise UnsupportedError: When trying to create a file with the name of a existing directory
-        """
-        if( self.is_root(path) ):
-            raise PathError(path)
-        elif( self.exists(path) and not wipe ):
-            raise PathError("File already exists")
-        elif( self.exists(path) and self.isdir(path)):
-            raise UnsupportedError("create a file with specified name. A folder with that name" + \
-                                   " already exists")
-        
-        self._upload(path, "")
-        
-    def open(self, path, mode='r', buffering=-1, encoding=None, 
-             errors=None, newline=None, line_buffering=False, **kwargs):
+    @synchronize
+    def open(self, path, mode="rb", **kwargs):
         """Open the named file in the given mode.
 
         This method downloads the file contents into a local temporary file
         so that it can be worked on efficiently.  Any changes made to the
         file are only sent back to cloud storage when the file is flushed or closed.
         """
-        
-        file_content = StringIO()
-        
-        if self.isdir(path):
-            raise ResourceInvalidError("'%s' is a directory" % path)
-        
-        
-        #  Truncate the file if requested
+        path = abspath(normpath(path))
+        spooled_file = SpooledTemporaryFile(mode=mode, bufsize=MAX_BUFFER)
+
         if "w" in mode:
-            self._upload(path, "")
+            # Truncate the file if requested
+            self.client.put_file(path, "", True)
         else:
+            # Try to write to the spooled file, if path doesn't exist create it if
+            # 'w' is in mode
             try:
-                file_content.write( self._cloud_command("get_file", path=path ) )
-                file_content.seek(0, 0)
+                spooled_file.write( self.client.get_file(path).read() )
+                spooled_file.seek(0, 0)
             except:
-                if "w" not in mode and "a" not in mode:
+                if "w" not in mode:
                     raise ResourceNotFoundError(path)
                 else:
-                    self._upload(path, "")
-        
-        f = LimitBytesFile(file_content.len, file_content, "r")
-            
-       
-        #  For streaming reads, return the key object directly
-        if mode == "r-":
-            return f
-        
-        #  For everything else, use a RemoteFileBuffer.
+                    self.createfile(path, True)
+
+
         #  This will take care of closing the socket when it's done.
-        return RemoteFileBuffer(self,path,mode,f)
-   
-        
-    def is_root(self, path):
-        if( path == self._root):
-            return True
-        else:
-            return False
-    def rename(self, src, dst, overwrite=False):
-        if self.is_root(path = src) or self.is_root(path=dst):
-            raise UnsupportedError("Can't rename the root directory")  
-        
-        resp = self._cloud_command('file_rename', from_path=src, to_path=dst)
-        return resp
-  
-    def remove(self, path, checkFile = True):
-        if self.is_root(path = path):
-            raise UnsupportedError("Can't remove the root directory")   
-             
-        resp = self._cloud_command('file_delete', path=path)
-        return resp
-    
-    def removedir(self, path):        
-        if not self.isdir(path):
-            raise PathError(path)
-        if self.is_root(path = path):
-            raise UnsupportedError("remove the root directory")
-        
-        return self.remove( path, False )
-    
-    def makedir(self, path, recursive=False, allow_recreate=False):
-        #  
-        #  @attention: dropbox currently doesn't support allow_recreate, so if a folder exists it will
-        #      always throw an error. Independent of the allow_recrerate flag
-        if self.is_root(path = path):
-            raise UnsupportedError("recreate the root directory")
-        if not self._checkRecursive(recursive, path):
-            raise UnsupportedError("recursively create specified folder")
-        if (not allow_recreate) and self.exists(path):
-            raise UnsupportedError(" recreate specified folder")
-        
-        resp = self._cloud_command('create_folder', path=path, recursive=recursive, 
-                                  allow_recreate=allow_recreate)
-        
-        return resp
-    
-    def _checkRecursive(self, recursive, path):
-        #  Checks if the new folder to be created is compatible with current
-        #  value of recursive
-        parts = path.split("/")
-        if( parts < 3 ):
-            return True
-        
-        testPath = "/".join( parts[:-1] )
-        if( self.exists(testPath) ):
-            return True
-        elif( recursive ):
-            return True
-        else:
-            return False
-    
+        return RemoteFileBuffer(self,path,mode,spooled_file)
+
+
+    @synchronize
+    def getcontents(self, path, mode="rb"):
+        path = abspath(normpath(path))
+        return self.open(self, path, mode).read()
+
+    def setcontents(self, path, data, *args, **kwargs):
+        path = abspath(normpath(path))
+        self.client.put_file(path, data, overwrite=True)
+
+    def desc(self, path):
+        return "%s in Dropbox" % path
+
+    def getsyspath(self, path, allow_none=False):
+        "Returns a path as the Dropbox API specifies."
+        if allow_none:
+            return None
+        return client.format_path(abspath(normpath(path)))
+
     def isdir(self, path):
         try:
             info = self.getinfo(path)
-        except:           
-            raise PathError(path)
-        
-        return info['is_dir']
-    
+            return info.get('isdir', False)
+        except ResourceNotFoundError:
+            return False
+
     def isfile(self, path):
         try:
             info = self.getinfo(path)
-        except:           
-            raise PathError(path)
-        
-        return not info['is_dir']
+            return not info.get('isdir', False)
+        except ResourceNotFoundError:
+            return False
 
-    
     def exists(self, path):
         try:
-            self._cloud_command("metadata", path=path)
+            self.getinfo(path)
             return True
-        except:
+        except ResourceNotFoundError:
             return False
-    
-    def listdir(self, path="/",
-                      wildcard=None,
-                      full=False,
-                      absolute=False,
-                      dirs_only=False,
-                      files_only=False,
-                      overrideCache=False
-                      ):
-        
-        data = self._cloud_command('metadata', path=path )
-        flist = self._get_dir_list_from_service( data )
 
-        dirContent = self._listdir_helper('/', flist, wildcard, full, absolute, dirs_only, files_only)
-        return dirContent
-    
-    def _get_dir_list_from_service(self, metadata):
-        flist = []
-        if metadata and metadata.has_key('contents'):
-            for one in metadata['contents']:
-                flist.append(one['path'])
-                
-        return flist  
-    
-    def listdirinfo(self, path="./",
-                          wildcard=None,
-                          full=False,
-                          absolute=False,
-                          dirs_only=False,
-                          files_only=False):
-        
-        metadata = self._cloud_command('metadata', path=path)
-        
-        path = normpath(path)
-        def getinfo(p):
-            if( metadata.has_key('contents') ):
-                contents = metadata['contents']
-                for one in contents:
-                    if( one['path'] == p ):
-                        return one
-             
-            return {}   
+    def listdir(self, path="/", wildcard=None, full=False, absolute=False, dirs_only=False, files_only=False):
+        path = abspath(normpath(path))
+        children = self.client.children(path)
+        return self._listdir_helper(path, children, wildcard, full, absolute, dirs_only, files_only)
 
-        return [(p, getinfo(p))
-                    for p in self.listdir(path,
-                                          wildcard=wildcard,
-                                          full=full,
-                                          absolute=absolute,
-                                          dirs_only=dirs_only,
-                                          files_only=files_only)]
-    
-        
-  
-        
-
-            
-
+    @synchronize
     def getinfo(self, path):
-        metadata = self._cloud_command('metadata', path=path)
-        
-        # Remove information about files in a directory
-        if metadata.has_key('contents'):
-            del metadata["contents"]
-        
-        return metadata
-    
-    def getpathurl(self, path, allow_none=False):
-        """Returns a url that corresponds to the given path, if one exists.
-        
-        If the path does not have an equivalent URL form (and allow_none is False)
-        then a :class:`~fs.errors.NoPathURLError` exception is thrown. Otherwise the URL will be
-        returns as an unicode string.
-        
-        :param path: a path within the filesystem
-        :param allow_none: if true, this method can return None if there is no
-            URL form of the given path
-        :type allow_none: bool
-        :raises `fs.errors.NoPathURLError`: If no URL form exists, and allow_none is False (the default)
-        :rtype: unicode 
-        
-        """
-        
-        url = None
-        try:
-            url = self._cloud_command("get_url", path=path)
-        except:
-            if not allow_none:
-                raise NoPathURLError(path=path)
+        path = abspath(normpath(path))
+        metadata = self.client.metadata(path)
+        return metadata_to_info(metadata, localtime=self.localtime)
 
-        return url
-    
-    
-    def getDropBoxClient(self):
-        access_token = self._credentials.get("access_token")
-        try:
-            return dropbox.client.DropboxClient(access_token)
-        except:
-            raise CreateFailedError("Access token is not valid")
+    def copy(self, src, dst, *args, **kwargs):
+        src = abspath(normpath(src))
+        dst = abspath(normpath(dst))
+        self.client.file_copy(src, dst)
+
+    def copydir(self, src, dst, *args, **kwargs):
+        src = abspath(normpath(src))
+        dst = abspath(normpath(dst))
+        self.client.file_copy(src, dst)
+
+    def move(self, src, dst, *args, **kwargs):
+        src = abspath(normpath(src))
+        dst = abspath(normpath(dst))
+        self.client.file_move(src, dst)
+
+    def movedir(self, src, dst, *args, **kwargs):
+        src = abspath(normpath(src))
+        dst = abspath(normpath(dst))
+        self.client.file_move(src, dst)
+
+    def rename(self, src, dst, *args, **kwargs):
+        src = abspath(normpath(src))
+        dst = abspath(normpath(dst))
+        self.client.file_move(src, dst)
+
+    def makedir(self, path, recursive=False, allow_recreate=False):
+        path = abspath(normpath(path))
+        self.client.file_create_folder(path)
+
+
+    def createfile(self, path, wipe=False):
+        self.client.put_file(path, '', overwrite=False)
+
+    def remove(self, path):
+        path = abspath(normpath(path))
+        self.client.file_delete(path)
+
+    def removedir(self, path, *args, **kwargs):
+        path = abspath(normpath(path))
+        self.client.file_delete(path)
+
+    def getpathurl(self, path):
+        path = abspath(normpath(path))
+        return self.client.media(path)
         
-    def _cloud_command(self, cmd, **kwargs):
-        path = kwargs.get('path','/')
-    
-        client = self.getDropBoxClient()
-            
-        if cmd == 'metadata':
-            # Return metadata for path
-            resp = client.metadata( path )
-            return resp
-        elif cmd == 'get_url':
-            # Returns file from dropbox service
-            info = client.media(path)
-            return info.get('url', None)
-        elif cmd == 'create_folder':
-            # Creates a new empty directory
-            resp = client.file_create_folder( path )
-            return resp
-        elif cmd == 'file_delete':
-            # Deletes file
-            resp = client.file_delete( path )
-            return resp
-        elif cmd == 'file_move':
-            from_path = kwargs.get('from_path','')
-            to_path = kwargs.get('to_path','') 
-
-            resp = client.file_move(from_path, to_path)
-            return resp
-        elif cmd == 'file_rename':
-            from_path = kwargs.get('from_path','')
-            to_path = kwargs.get('to_path','') 
-
-            resp = client.file_move(from_path, to_path)
-            return resp           
-        elif cmd == 'put_file':
-            # Puts file to dropbox
-            overwrite = kwargs.get('overwrite', False)
-            parent_rev = kwargs.get('parent_rev', None)
-            resp = client.put_file(path, kwargs.get('data'), overwrite = overwrite, 
-                                   parent_rev = parent_rev)
-            return resp
-            
-        return None   
-    
-    
-    
-"""
-Problems:
-  - Flush and close, both call write contents and because of that 
-    the file on cloud is overwrite twice...
-"""
+        
