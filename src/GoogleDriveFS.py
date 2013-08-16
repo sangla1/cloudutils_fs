@@ -88,12 +88,18 @@ class GoogleDriveFS(FS):
     def __repr__(self):
         args = (self.__class__.__name__, self._root)
         
-        return 'FileSystem: %s \nRoot: %s' % args
+        return '< FileSystem: %s - Root Directory: %s >' % args
 
     __str__ = __repr__
     
     
     def _update(self, path, data):
+        """
+        Updates content of an existing file
+        
+        @param path: Id of the file for which to update content
+        @param data: content to write to the file  
+        """
         if isinstance(data, basestring):
             string_data = data
         else:
@@ -106,19 +112,27 @@ class GoogleDriveFS(FS):
         
         return self._cloud_command("update_file", path=path, content=string_data)
     
-    def setcontents(self, path, data="", encoding=None, errors=None, chunk_size=64*1024):
+    def setcontents(self, path, data="", chunk_size=64*1024, **kwargs):
         """
-        Sets contents to remote file.
-        @param path: Id of the file
+        Sets new content to remote file
+        
+        Method works only with existing files and sets new content to them.
+        @param path: Id of the file in which to write the new content
         @param data: File content as a string, or a StringIO object
+        @param kwargs: additional parameters like:
+            encoding: the type of encoding to use if data is text
+            errors: encoding errors
+        @param chunk_size: Number of bytes to read in a chunk, if the implementation has to resort to a read / 
+            copy loop 
         """ 
+        encoding = kwargs.get("encoding", None)
+        errors = kwargs.get("errors", None)
+        
         if isinstance(data, six.text_type):
             data = data.encode(encoding=encoding, errors=errors)
 
         self._update(path, data)
 
-    
-    
     def createfile(self, path, wipe=True, **kwargs):
         """Creates an empty file always, even if another file with the same name exists
         
@@ -160,6 +174,7 @@ class GoogleDriveFS(FS):
         so that it can be worked on efficiently.  Any changes made to the
         file are only sent back to cloud storage when the file is flushed or closed.
         """
+
         
         file_content = StringIO()
         
@@ -349,12 +364,16 @@ class GoogleDriveFS(FS):
         return info["mimeType"] == "application/vnd.google-apps.folder"
         
     def isdir(self, path):
-        if( path == "/" ):
-            path = self._root
+        
+        #Fix for superclass FS, in GoogleDrive you can't get
+        # info about the root folder
+        if( path=="/" or path==self._root ):
             return True
+        
+        
         try:
             info = self.getinfo(path)
-        except:           
+        except:         
             raise PathError(path)
         
         return self._isdir(info)
@@ -364,12 +383,18 @@ class GoogleDriveFS(FS):
         return info["mimeType"] != "application/vnd.google-apps.folder"
     
     def isfile(self, path):
+        #Fix for superclass FS, in GoogleDrive you can't get
+        # info about the root folder
+        if( path=="/" or path==self._root ):
+            return False
+        
+        
         try:
             info = self.getinfo(path)
         except:           
             raise PathError(path)
         
-        self._isfile(info)
+        return self._isfile(info)
     
     
     def exists(self, path):
@@ -443,7 +468,7 @@ class GoogleDriveFS(FS):
         @param path: file id for which to return informations
         @return: dictionary with informations about the specific file 
         @raise PathError: if the provided path doesn't exist 
-        """        
+        """       
         if(not self.exists(path)):
             raise PathError("Specified path doesn't exist")
         
@@ -494,7 +519,6 @@ class GoogleDriveFS(FS):
             path = path[1:]
         if( len(path) == 0 ):
             path = self._root
-        
         
         if cmd == 'list_dir':
             # Return directory list
