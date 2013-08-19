@@ -12,7 +12,10 @@ import calendar
 from UserDict import UserDict
 from fs.base import *
 from fs.path import *
-from fs.errors import *
+from fs.errors import DirectoryNotEmptyError, UnsupportedError, \
+                      CreateFailedError, ResourceInvalidError, \
+                      ResourceNotFoundError, \
+                      OperationFailedError, DestinationExistsError
 from fs.remote import RemoteFileBuffer
 from fs.filelike import SpooledTemporaryFile
 
@@ -99,8 +102,8 @@ class DropboxClient(client.DropboxClient):
             except rest.ErrorResponse, e:
                 if e.status == 404:
                     raise ResourceNotFoundError(path)
-                raise RemoteConnectionError(opname='metadata', path=path,
-                                            errno=e.status)
+                raise OperationFailedError(opname='metadata', path=path,
+                                            msg=str(e) )
             if metadata.get('is_deleted', False):
                 raise ResourceNotFoundError(path)
             item = self.cache[path] = CacheItem(metadata)
@@ -137,8 +140,8 @@ class DropboxClient(client.DropboxClient):
                 item = self.cache[path] = CacheItem(metadata, children)
             except rest.ErrorResponse, e:
                 if not item or e.status != 304:
-                    raise RemoteConnectionError(opname='metadata', path=path,
-                                                errno=e.status)
+                    raise OperationFailedError(opname='metadata', path=path,
+                                                msg=str(e) )
                 # We have an item from cache (perhaps expired), but it's
                 # hash is still valid (as far as Dropbox is concerned),
                 # so just renew it and keep using it.
@@ -150,12 +153,11 @@ class DropboxClient(client.DropboxClient):
         try:
             metadata = super(DropboxClient, self).file_create_folder(path)
         except rest.ErrorResponse, e:
-            if e.status == 404:
-                raise ParentDirectoryMissingError(path)
             if e.status == 403:
                 raise DestinationExistsError(path)
-            raise RemoteConnectionError(opname='file_create_folder', path=path,
-                                        errno=e.status)
+            if e.status == 400:
+                raise OperationFailedError(opname='file_create_folder', msg=str(e) )
+            
         self.cache.set(path, metadata)
 
     def file_copy(self, src, dst):
@@ -166,8 +168,10 @@ class DropboxClient(client.DropboxClient):
                 raise ResourceNotFoundError(src)
             if e.status == 403:
                 raise DestinationExistsError(dst)
-            raise RemoteConnectionError(opname='file_copy',
-                                        errno=e.status)
+            if e.status == 503:
+                raise OperationFailedError(opname='file_copy', msg="User over storage quota")
+            raise OperationFailedError(opname='file_copy', msg= str(e) )
+            
         self.cache.set(dst, metadata)
 
     def file_move(self, src, dst):
@@ -178,8 +182,10 @@ class DropboxClient(client.DropboxClient):
                 raise ResourceNotFoundError(src)
             if e.status == 403:
                 raise DestinationExistsError(dst)
-            raise RemoteConnectionError(opname='file_move',
-                                        errno=e.status)
+            if e.status == 503:
+                raise OperationFailedError(opname='file_copy', msg="User over storage quota")
+            raise OperationFailedError(opname='file_copy', msg= str(e) )
+            
         self.cache.pop(src, None)
         self.cache.set(dst, metadata)
 
@@ -191,17 +197,17 @@ class DropboxClient(client.DropboxClient):
                 raise ResourceNotFoundError(path)
             if e.status == 400 and 'must not be empty' in str(e):
                 raise DirectoryNotEmptyError(path)
-            raise
+            raise OperationFailedError(opname='file_copy', msg=str(e) )
         self.cache.pop(path, None)
 
     def put_file(self, path, f, overwrite=False):
         try:
             super(DropboxClient, self).put_file(path, f, overwrite=overwrite)
         except rest.ErrorResponse, e:
-            raise RemoteConnectionError(opname='put_file', path=path,
-                                        errno=e.status)
+            raise OperationFailedError(opname='file_copy', msg=str(e) )
         except TypeError, e:
-            raise OperationFailedError("put_file", path, msg="Provided data is of the wrong type")
+            raise ResourceInvalidError("put_file", path)
+        
         self.cache.pop(dirname(path), None)
 
             
@@ -215,8 +221,7 @@ class DropboxClient(client.DropboxClient):
             if e.status == 404:
                 raise ResourceNotFoundError(path)
             
-            raise RemoteConnectionError(opname='metadata', path=path,
-                                        errno=e.status)
+            raise OperationFailedError(opname='file_copy', msg=str(e) )
 
 
 
@@ -226,6 +231,9 @@ def metadata_to_info(metadata, localtime=False):
         'size': metadata.pop('bytes', 0),
         'isdir': isdir,
         'isfile': not isdir,
+        'revision': metadata.pop('revision', 0),
+        'path': metadata.pop('path', 0),
+        'mime_type': metadata.pop('mime_type', 0)
     }
     try:
         mtime = metadata.pop('modified', None)
@@ -245,7 +253,7 @@ def metadata_to_info(metadata, localtime=False):
 
 
 class DropboxFS(FS):
-    """A FileSystem that stores data in Dropbox."""
+    """A Dropbox filesystem."""
 
     _meta = { 'thread_safe' : True,
               'virtual' : False,
@@ -398,12 +406,29 @@ class DropboxFS(FS):
         self.client.file_move(src, dst)
 
     def makedir(self, path, recursive=False, allow_recreate=False):
+        """
+        @param path: path to the folder to be created. If only the new folder is specified
+            it will be created in the root directory
+        @param recursive: allows recursive creation of directories
+        @param allow_recreate: dropbox currently doesn't support allow_recreate, so if a folder exists it will
+            always throw an error. Independent of the allow_recrerate flag
+        """
+        if not self._checkRecursive(recursive, path):
+            raise UnsupportedError("recursively create specified folder")
+        
         path = abspath(normpath(path))
         self.client.file_create_folder(path)
 
 
     def createfile(self, path, wipe=False):
-        self.client.put_file(path, '', overwrite=False)
+        """Creates an empty file
+        
+        @param path: path to the new file.
+        @param wipe: If this is true and a file with the same name already exists 
+            at specified path it will be wiped.
+        
+        """
+        self.client.put_file(path, '', overwrite=wipe)
 
     def remove(self, path):
         path = abspath(normpath(path))
@@ -417,4 +442,18 @@ class DropboxFS(FS):
         path = abspath(normpath(path))
         return self.client.media(path)
         
+    
+    def _checkRecursive(self, recursive, path):
+        #  Checks if the new folder to be created is compatible with current
+        #  value of recursive
+        parts = path.split("/")
+        if( parts < 3 ):
+            return True
         
+        testPath = "/".join( parts[:-1] )
+        if( self.exists(testPath) ):
+            return True
+        elif( recursive ):
+            return True
+        else:
+            return False    

@@ -3,23 +3,278 @@ from StringIO import StringIO
 import mimetypes
 import os
 import datetime
+import time
+from UserDict import UserDict
 
 # python filesystem imports
 from fs.base import FS
 from fs.errors import PathError, UnsupportedError, \
                       CreateFailedError, ResourceInvalidError, \
-                      ResourceNotFoundError, NoPathURLError
+                      ResourceNotFoundError, NoPathURLError, \
+                      OperationFailedError
 from fs.remote import RemoteFileBuffer
-from fs.filelike import LimitBytesFile
+from fs.filelike import SpooledTemporaryFile
 
 # Imports specific to google drive service
 import httplib2
 from apiclient.discovery import build
 from apiclient.http import MediaInMemoryUpload
 from oauth2client.client import OAuth2Credentials
+from apiclient import errors
+import simplejson
+
+# Items in cache are considered expired after 5 minutes.
+CACHE_TTL = 300
+# The format Dropbox uses for times.
+TIME_FORMAT = '%a, %d %b %Y %H:%M:%S +0000'
+# Max size for spooling to memory before using disk (5M).
+MAX_BUFFER = 1024**2*5
+
+
+class CacheItem(object):
+    """Represents a path in the cache. There are two components to a path.
+       It's individual metadata, and the children contained within it."""
+    def __init__(self, metadata=None, children=None, timestamp=None):
+        self.metadata = metadata
+        self.children = children
+        if timestamp is None:
+            timestamp = time.time()
+        self.timestamp = timestamp
+
+    def add_child(self, name):
+        if self.children is None:
+            self.children = [name]
+        else:
+            self.children.append(name)
+
+    def del_child(self, name):
+        if self.children is None:
+            return
+        try:
+            i = self.children.index(name)
+        except ValueError:
+            return
+        self.children.pop(i)
+
+    def _get_expired(self):
+        if self.timestamp <= time.time() - CACHE_TTL:
+            return True
+    expired = property(_get_expired)
+
+    def renew(self):
+        self.timestamp = time.time()
+
+
+class GoogleDriveCache(UserDict):
+    def set(self, path, metadata):
+        self[path] = CacheItem(metadata)
+
+    def pop(self, path, default=None):
+        value = UserDict.pop(self, path, default)
+        return value
+
+
+class GoogleDriveClient(object):
+    def __init__(self, credentials):
+        self.service = self._build_service(credentials)
+        self.cache = GoogleDriveCache()
+        
+    def _build_service(self, credentials):
+        http = httplib2.Http()
+        http = credentials.authorize(http);
+        service = build('drive', 'v2', http=http)
+        return service
+    
+    def get_file(self, file_id):
+        if( not self.cache.get(file_id, None) ):
+            try: 
+                f = self.service.files().get(fileId=file_id).execute()
+            except errors.HttpError, e:
+                if e.resp.status == 404:
+                    raise ResourceNotFoundError("Source file doesn't exist")
+                
+                raise OperationFailedError(opname='get_file', msg= e.resp.reason )
+            
+            self.cache.set(f["id"], f)
+            download_url = f.get('downloadUrl')
+            resp, content = self.service._http.request(download_url)
+            return content
+        else:
+            f = self.cache[file_id]
+            download_url = f.metadata.get('downloadUrl')
+            resp, content = self.service._http.request(download_url)
+            if( resp.status == 200 ):
+                return content
+            else:
+                raise OperationFailedError(opname="get_file", msg=str(resp))  
+        
+        
+    def metadata(self, path):
+        "Gets metadata for a given path."
+        item = self.cache.get(path)
+        if not item or item.metadata is None or item.expired:
+            try:
+                metadata = self.service.files().get(fileId=path).execute()
+            except errors.HttpError, e:
+                if e.resp.status == 404:
+                    raise ResourceNotFoundError(path)
+                
+                raise OperationFailedError(opname='metadata', path=path,
+                                            msg=e.resp.reason )
+            if metadata.get('trashed', False):
+                raise ResourceNotFoundError(path)
+            
+            item = self.cache[path] = CacheItem(metadata)
+        # Copy the info so the caller cannot affect our cache.
+        return dict(item.metadata.items())
+    
+    def children(self, path):
+        "Gets children of a given path."
+        update = False
+        item = self.cache.get(path)
+        if item:
+            if item.expired:
+                update = True
+            else:
+                if item.metadata["mimeType"] != "application/vnd.google-apps.folder":
+                    raise ResourceInvalidError(path)
+            if not item.children:
+                update = True
+        else:
+            update = True
+        if update:
+            try:
+                metadata = self.service.files().get(fileId=path).execute()
+                if metadata["mimeType"] != "application/vnd.google-apps.folder":
+                    raise ResourceInvalidError(path)
+                
+                param = {"q":  "'%s' in parents" % path}
+                children = []
+                contents = self.service.files().list(**param).execute().pop('items')
+                for child in contents:
+                    if child.get('trashed', False):
+                        continue
+                    children.append(child['id'])
+                    self.cache[child['id']] = CacheItem(child)
+                item = self.cache[path] = CacheItem(metadata, children)
+            except errors.HttpError, e:
+                if not item or e.resp.status != 304:
+                    raise OperationFailedError(opname='metadata',path=path, msg=e.resp.reason )
+                # We have an item from cache (perhaps expired), but it's
+                # hash is still valid (as far as Dropbox is concerned),
+                # so just renew it and keep using it.
+                item.renew()
+        return item.children
+        
+    def file_create_folder(self, parent_id, title):
+        "Add newly created directory to cache."
+        body = {
+                "title": title,
+                "parents": [{"id": parent_id}],
+                "mimeType": "application/vnd.google-apps.folder"
+                }
+        try:
+            metadata = self.service.files().insert(body=body).execute()
+        except errors.HttpError, e:
+            raise OperationFailedError(opname='file_create_folder', msg=e.resp.reason + \
+                                       ", the reasons could be: parent doesn't exist or is a file" )
+            
+        self.cache.set(metadata["id"], metadata)
+        return metadata
+    
+    def file_copy(self, file_id, parent_id):
+        body = {"parents": [{"id": parent_id}]}
+            
+        
+        try:
+            metadata = self.service.files().copy(
+                                    fileId = file_id,
+                                    body = body
+                                    ).execute()
+        except errors.HttpError, e:
+            if e.resp.status == 404:
+                raise ResourceNotFoundError("Parent or source file don't exist")
+            
+            raise OperationFailedError(opname='file_copy', msg= e.resp.reason )
+            
+        self.cache.set(metadata['id'], metadata)
+    
+    def update_file(self, file_id, new_file):
+        try: 
+            metadata = self.service.files().update(
+                                                  fileId = file_id,
+                                                  body = new_file
+                                                  ).execute()
+        except errors.HttpError, e:
+            if e.resp.status == 404:
+                raise ResourceNotFoundError("Parent or source file don't exist")
+            
+            raise OperationFailedError(opname='file_copy', msg=e.resp.reason )
+         
+        self.cache.pop(file_id, None)
+        self.cache.set(metadata['id'], metadata)
+    
+    def update_file_content(self, file_id, content):
+        # Updates a file on google drive
+        f = self.cache.get(file_id, None)
+        if( f == None ):
+            metadata = self.service.files().get(fileId=file_id).execute()
+            self.cache.set(file_id, metadata)
+        else:
+            metadata = f.metadata    
+        media_body = MediaInMemoryUpload(content)
+        try: 
+            updated_file = self.service.files().update(
+                                                  fileId = file_id,
+                                                  body = metadata,
+                                                  media_body=media_body
+                                                  ).execute()
+        except errors.HttpError, e:
+            raise OperationFailedError(opname='update_file_content', msg=e.resp.reason )
+        except TypeError, e:
+            raise ResourceInvalidError("update_file_content %r" % e)  
+        
+        self.cache.pop(file_id, None)
+        self.cache.set(file_id, updated_file)
+                                                    
+    def file_delete(self, path):
+        try:
+            self.service.files().delete(fileId=path).execute()
+        except errors.HttpError, e:
+            if e.resp.status == 404:
+                raise ResourceNotFoundError(path)
+            raise OperationFailedError(opname='file_copy', msg=e.resp.reason )
+        self.cache.pop(path, None)     
+        
+    def put_file(self, parent_id, title, content, description=None):
+        media_body = MediaInMemoryUpload(content)
+        body = {
+                'title': title,
+                'description': description
+                }
+
+        body['parents'] = [{'id': parent_id}]
+
+        try:
+            metadata = self.service.files().insert(
+                                                  body=body,
+                                                  media_body=media_body
+                                                  ).execute()
+        except errors.HttpError, e:
+            raise OperationFailedError(opname='put_file', msg=e.resp.reason )
+        except TypeError, e:
+            raise ResourceInvalidError("put_file")
+        
+        self.cache.set(metadata['id'], metadata)
+
+    def about(self):
+        return self.service.about().get().execute()
+        
 
 
 
+        
+        
 class GoogleDriveFS(FS):
     """
         Google drive file system
@@ -75,10 +330,11 @@ class GoogleDriveFS(FS):
                                 None
                                 )
         
+        
+        self.client = GoogleDriveClient(credentials)
                 
         if (self._root == None):
-            service = self._build_service(self._credentials)
-            about = service.about().get().execute()
+            about = self.client.about()
             self._root = about.get("rootFolderId")
             
         super(GoogleDriveFS, self).__init__(thread_synchronize=thread_synchronize)
@@ -100,6 +356,8 @@ class GoogleDriveFS(FS):
         @param path: Id of the file for which to update content
         @param data: content to write to the file  
         """
+        path = self._normpath(path)
+        
         if isinstance(data, basestring):
             string_data = data
         else:
@@ -110,7 +368,7 @@ class GoogleDriveFS(FS):
                 raise ResourceInvalidError("Unsupported type")
             
         
-        return self._cloud_command("update_file", path=path, content=string_data)
+        return self.client.update_file_content(path, string_data)
     
     def setcontents(self, path, data="", chunk_size=64*1024, **kwargs):
         """
@@ -124,13 +382,16 @@ class GoogleDriveFS(FS):
             errors: encoding errors
         @param chunk_size: Number of bytes to read in a chunk, if the implementation has to resort to a read / 
             copy loop 
-        """ 
+        """
+        path = self._normpath(path)
+         
         encoding = kwargs.get("encoding", None)
         errors = kwargs.get("errors", None)
         
         if isinstance(data, six.text_type):
             data = data.encode(encoding=encoding, errors=errors)
-
+        
+        
         self._update(path, data)
 
     def createfile(self, path, wipe=True, **kwargs):
@@ -164,7 +425,7 @@ class GoogleDriveFS(FS):
         else:
             description = ""
         
-        self._cloud_command("create_new_file", title=title, parent_id=parent_id, description=description)
+        self.client.put_file(parent_id, title, "", description)
         
     def open(self, path, mode='r',  buffering=-1, encoding=None, 
              errors=None, newline=None, line_buffering=False, **kwargs):
@@ -174,57 +435,42 @@ class GoogleDriveFS(FS):
         so that it can be worked on efficiently.  Any changes made to the
         file are only sent back to cloud storage when the file is flushed or closed.
         """
-
+        path = self._normpath(path)
         
-        file_content = StringIO()
-        
-        if self.isdir(path):
-            raise ResourceInvalidError("'%s' is a directory" % path)
-        
+        spooled_file = SpooledTemporaryFile(mode=mode, bufsize=MAX_BUFFER)
         
         #  Truncate the file if requested
         if "w" in mode:
             self._update(path, "")
         else:
             try:
-                file_content.write( self._cloud_command("get_file", path=path ) )
-                file_content.seek(0, 0)
+                spooled_file.write( self.client.get_file( path ) )
+                spooled_file.seek(0, 0)
             except Exception, e:
                 if "w" not in mode and "a" not in mode:
                     raise ResourceNotFoundError("%r" % e)
                 else:
-                    self._upload(path, "")
+                    self.createfile(path, True)
+
         
-        f = LimitBytesFile(file_content.len, file_content, "r")
-            
-       
-        #  For streaming reads, return the key object directly
-        if mode == "r-":
-            return f
-        
-        #  For everything else, use a RemoteFileBuffer.
-        #  This will take care of closing the socket when it's done.
-        return RemoteFileBuffer(self,path,mode,f)
+        return RemoteFileBuffer(self,path,mode,spooled_file)
    
         
     def is_root(self, path):
+        path = self._normpath(path)
+        
         if( path == self._root):
             return True
         else:
             return False
-        
-        
+
     
     def copy(self, src, dst, overwrite=False, chunk_size=1024 * 64):
         """
         @param src: Id of the file to be copied
         @param dst: Id of the folder in which to copy the file
         """
-        if( self.isdir(src) ):
-            raise PathError("Specified src is a directory. Please use copydir.")
-        
-        
-        self._copy(src, dst)
+        self.client.file_copy(src, dst)
     
     def copydir(self, src, dst, overwrite=False, ignore_errors=False, chunk_size=16384):
         """
@@ -234,17 +480,6 @@ class GoogleDriveFS(FS):
         
         raise NotImplemented("If implemented method will be very inefficient")
     
-    
-    def _copy(self, src, dst):
-        src_info = self.exists(src)
-        if( not src_info ):
-            raise PathError("Specified src doesn't exist")
-        
-        if( not self.isdir(dst) ):
-            raise PathError("Specified dst is not a folder")
-        
-        return self._cloud_command("copy_file", src=src, dst=dst)
-    
     def rename(self, src, dst):
         """
         @param src: id of the file to be renamed 
@@ -253,8 +488,10 @@ class GoogleDriveFS(FS):
         if self.is_root(path = src):
             raise UnsupportedError("Can't rename the root directory")  
         
-        resp = self._cloud_command('file_rename', file_id=src, title=dst)
-        return resp
+        f = self.client.get_file(src)
+        f['title'] = dst
+        
+        self.client.update_file(src, f)
   
     def remove(self, path):
         """
@@ -266,8 +503,8 @@ class GoogleDriveFS(FS):
             raise UnsupportedError("Can't remove the root directory")   
         if self.isdir(path = path):
             raise PathError("Specified path is a directory. Please use removedir.")  
-
-        return self._cloud_command('file_delete', path=path)
+        
+        self.client.file_delete(path)
     
     def removedir(self, path):
         """
@@ -279,7 +516,7 @@ class GoogleDriveFS(FS):
         if self.is_root(path = path):
             raise UnsupportedError("remove the root directory")
         
-        return self._cloud_command('file_delete', path=path)
+        self.client.file_delete(path)
     
     def makedir(self, path, recursive=False, allow_recreate=False ):
         """
@@ -306,7 +543,7 @@ class GoogleDriveFS(FS):
             if( recursive ):
                 for i in range( len(parts) - 1 ):
                     title = parts[i+1]
-                    resp = self._cloud_command("file_create_folder", parent_id=parent_id, title=title)
+                    resp = self.client.file_create_folder(parent_id, title)
                     parent_id=resp["id"]
             else:
                 raise UnsupportedError("recursively create a folder")
@@ -316,7 +553,7 @@ class GoogleDriveFS(FS):
                 parent_id = self._root
             else:
                 title = parts[1]
-            self._cloud_command("file_create_folder", parent_id=parent_id, title=title)
+            self.client.file_create_folder(parent_id, title)
     
     def move(self, src, dst, overwrite=False, chunk_size=16384):
         """
@@ -331,7 +568,11 @@ class GoogleDriveFS(FS):
         """ 
         if( self.isdir(src) ):
             raise PathError("Specified src is a directory. Please use movedir.")
-        self._move(src, dst)
+        
+        f = self.client.get_file(src)
+        f['parents'] = [{"id":dst}]
+        
+        self.client.update_file(src, f)
     
     def movedir(self, src, dst, overwrite=False, ignore_errors=False, chunk_size=16384):
         """
@@ -346,36 +587,20 @@ class GoogleDriveFS(FS):
         """  
         if( self.isfile(src) ):
             raise PathError("Specified src is a file. Please use move.")
-        self._move(src, dst)
-    
-    def _move(self, src, dst):
-        src_info = self.exists(src)
-        dst_info = self.exists(dst)       
-             
-        if( not ( src_info or dst_info ) ):
-            raise PathError("Source or destination don't exist")
-        if( self._isfile(dst_info) ):
-            raise PathError("Specified destination is not a folder")
+        
+        f = self.client.get_file(src)
+        f['parents'] = [{"id":dst}]
+        
+        self.client.update_file(src, f)
 
-        src_info['parents'] = [{"id": dst}]
-        self._cloud_command("update_file_info", path=src, new_file=src_info)
         
     def _isdir(self, info):
         return info["mimeType"] == "application/vnd.google-apps.folder"
         
     def isdir(self, path):
+        path = self._normpath(path)
         
-        #Fix for superclass FS, in GoogleDrive you can't get
-        # info about the root folder
-        if( path=="/" or path==self._root ):
-            return True
-        
-        
-        try:
-            info = self.getinfo(path)
-        except:         
-            raise PathError(path)
-        
+        info = self.client.metadata(path)
         return self._isdir(info)
 
     
@@ -383,34 +608,21 @@ class GoogleDriveFS(FS):
         return info["mimeType"] != "application/vnd.google-apps.folder"
     
     def isfile(self, path):
-        #Fix for superclass FS, in GoogleDrive you can't get
-        # info about the root folder
-        if( path=="/" or path==self._root ):
-            return False
+        path = self._normpath(path)
+
         
-        
-        try:
-            info = self.getinfo(path)
-        except:           
-            raise PathError(path)
-        
+        info = self.client.metadata(path)
         return self._isfile(info)
     
     
     def exists(self, path):
+        path = self._normpath(path)
         try:
-            return self._cloud_command("get_file_info", path = path)
+            return self.client.metadata(path)
         except:
             return False
     
-    
-    def _get_dir_list_from_service(self, metadata):
-        flist = []
-        if metadata and metadata.has_key('items'):
-            for one in metadata['items']:
-                flist.append(one['id'])
-                
-        return flist 
+
     
     def listdir(self, path=None,
                       wildcard=None,
@@ -420,11 +632,9 @@ class GoogleDriveFS(FS):
                       files_only=False,
                       overrideCache=False
                       ):
-        if( not path or path == "/" ):
-            path = self._root
-        data = self._cloud_command('list_dir', path=path )
-        flist = self._get_dir_list_from_service( data )
-
+        path = self._normpath(path)
+        flist = self.client.children(path)
+        
         dirContent = self._listdir_helper('', flist, wildcard, full, absolute, dirs_only, files_only)
         return dirContent
     
@@ -436,21 +646,9 @@ class GoogleDriveFS(FS):
                           dirs_only=False,
                           files_only=False):
         
-        if( not path ):
-            path = self._root
-        
-        metadata = self._cloud_command('list_dir_with_info', path=path)
-        
-        def getinfo(p):
-            if( metadata.has_key('items') ):
-                contents = metadata['items']
-                for one in contents:
-                    if( one['id'] == p ):
-                        return one
-             
-            return {}   
-
-        return [(p, getinfo(p))
+        path = self._normpath(path)       
+ 
+        return [(p, self.getinfo(p))
                     for p in self.listdir(path,
                                           wildcard=wildcard,
                                           full=full,
@@ -468,11 +666,9 @@ class GoogleDriveFS(FS):
         @param path: file id for which to return informations
         @return: dictionary with informations about the specific file 
         @raise PathError: if the provided path doesn't exist 
-        """       
-        if(not self.exists(path)):
-            raise PathError("Specified path doesn't exist")
-        
-        resp = self._cloud_command("get_file_info", path = path)
+        """
+        path = self._normpath(path)
+        resp = self.client.metadata(path)
         return resp
         
     
@@ -491,6 +687,7 @@ class GoogleDriveFS(FS):
         @rtype: unicode 
         
         """
+        path = self._normpath(path)
         
         url = None
         try:
@@ -501,136 +698,22 @@ class GoogleDriveFS(FS):
                 raise NoPathURLError(path=path)
 
         return url
+   
+    def desc(self, path):
+        path = self._normpath(path)
+        return self.getinfo(path)["title"]
     
-    
-    def _build_service(self, credentials):
-        http = httplib2.Http()
-        http = credentials.authorize(http);
-        service = build('drive', 'v2', http=http)
-        return service
+    def _normpath(self, path):
+        if(path[0] == "/" and len(path) == 1):
+            return self._root
+        elif(path[0] == "/"):
+            return path[1:]
+        elif(len(path) == 0):
+            return self._root
+        elif(path == None):
+            return self._root
         
-    def _cloud_command(self, cmd, **kwargs):
-        path = kwargs.get('path', self._root)
-        service = self._build_service(self._credentials)
-        
-        # This is needed for browse, and some parts of pyfs
-        # because it always puts / on the begining
-        if( path[0] == "/" ):
-            path = path[1:]
-        if( len(path) == 0 ):
-            path = self._root
-        
-        if cmd == 'list_dir':
-            # Return directory list
-            resp = service.children().list(folderId=path).execute()
-            return resp
-        elif cmd == 'list_dir_with_info':
-            # Return directory list
-            param = {"q":  "'%s' in parents" % path}
-            resp = service.files().list(**param).execute()
-            return resp
-        elif cmd == 'get_file':
-            if( not self.cached_files.has_key(path) ): 
-                f = service.files().get(fileId=path).execute()
-                if(self._cacheing):
-                    self.cached_files[f["id"]] = f
-            else:
-                f = self.cached_files[path]
-                
-            download_url = f.get('downloadUrl')
-            resp, content = service._http.request(download_url)
-            if( resp.status == 200 ):
-                return content
-            else:
-                return None   
-        elif cmd == 'get_file_info':
-            f = service.files().get(fileId=path).execute()
-            return f  
-        elif cmd == 'create_new_file':
-            title = kwargs.get("title", "untitled.txt")
-            parent_id = kwargs.get("parent_id", self._root)
-            description = kwargs.get("description", "")
-            body = {
-                    "title": title,
-                    "parents": [{"id": parent_id}],
-                    "description": description,
-                    "mimeType": mimetypes.guess_type(title)
-                    }
-            f = service.files().insert(
-                                       body = body
-                                       ).execute()
-
-            return f 
-        elif cmd == 'file_create_folder':
-            # Creates a new empty directory
-            parent_id = kwargs.get("parent_id", self._root)
-            title = kwargs.get("title", "untitled")
-            body = {
-                    "title": title,
-                    "parents": [{"id": parent_id}],
-                    "mimeType": "application/vnd.google-apps.folder"
-                    }
-            resp = service.files().insert(body=body).execute()
-            return resp
-        elif cmd == 'file_delete':
-            # Deletes file
-            resp = service.files().delete(fileId=path).execute()
-            # Return empty body if everything was OK
-            return resp
-        elif cmd == 'copy_file':
-            source_id = kwargs.get('src','')
-            parent_id = kwargs.get('dst','') 
-            
-            body = {"parents": [{"id": parent_id}]}
-            
-            return service.files().copy(
-                                        fileId = source_id,
-                                        body = body
-                                        ).execute()
-            
-        elif cmd == 'file_rename':
-            file_id = kwargs.get('file_id','')
-            title = kwargs.get('title','untitled') 
-            f = self.cached_files.get(path, None)
-
-            if( f == None ):
-                f = service.files().get(fileId=file_id).execute()
-            
-            f['title'] = title    
-            updated_file = service.files().update( fileId = file_id,
-                                                   body = f
-                                                  ).execute()
-            if(self._cacheing):                                      
-                self.cached_files[path] = updated_file
-            return updated_file        
-        elif cmd == 'update_file':
-            # Updates a file on google drive
-            f = self.cached_files.get(path, None)
-            if( f == None ):
-                f = service.files().get(fileId=path).execute()
-            content = kwargs.get("content")
-            media_body = MediaInMemoryUpload(content)
-            updated_file = service.files().update(
-                                                  fileId = path,
-                                                  body = f,
-                                                  media_body=media_body
-                                                  ).execute()
-            if(self._cacheing):
-                self.cached_files[path] = updated_file
-            return updated_file
-        elif cmd == 'update_file_info':
-            # Updates a file on google drive
-            f = kwargs.get("new_file")
-            updated_file = service.files().patch(
-                                                  fileId = path,
-                                                  body = f,
-                                                  fields="parents"
-                                                  ).execute()
-            if(self._cacheing):
-                self.cached_files[path] = updated_file
-            return updated_file
-        return None
-    
+        return path
     
     
 """
