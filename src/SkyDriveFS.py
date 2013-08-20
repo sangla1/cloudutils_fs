@@ -549,8 +549,7 @@ class SkyDriveFS(FS):
         if(not self.exists(path)):
             raise PathError("Specified path doesn't exist")
         
-        resp = self.client.metadata(path)
-        return resp
+        return self._metadata_to_info( self.client.metadata(path) )
         
     
     def getpathurl(self, path, allow_none=False):
@@ -595,6 +594,19 @@ class SkyDriveFS(FS):
             return self._root
         
         return path
+    
+    def _metadata_to_info(self, metadata, localtime=False):
+        isdir = metadata["type"] == "folder"
+        info = {
+            'isdir': isdir,
+            'title': metadata.pop('name', 0),
+            'created_time': metadata.pop('createdDate', 0),
+            'mime_type': metadata.pop('type', 0)
+        }
+        
+        info.update(metadata)
+        
+        return info
 """
 Problems:
   - Flush and close, both call write contents and because of that 

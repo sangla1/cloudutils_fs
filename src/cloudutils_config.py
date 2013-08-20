@@ -35,4 +35,6 @@ CFG_DROPBOX_ROWS_PER_PAGE = 10
 
 # Google drive configuration
 
-
+CFG_GOOGLE_DRIVE_CLIENT_ID = "431737843323.apps.googleusercontent.com"
+CFG_GOOGLE_DRIVE_CLIENT_SECRET = "7zPzxxXjzWKSUrVARio0-6vz" 
+CFG_GOOGLE_DRIVE_SCOPE = "https://www.googleapis.com/auth/drive.file"

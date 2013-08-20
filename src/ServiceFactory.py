@@ -2,8 +2,9 @@ from DropboxFS import DropboxFS
 from GoogleDriveFS import GoogleDriveFS
 from SkyDriveFS import SkyDriveFS
 import dropbox
-from cloudutils_config import *
-from dropbox.client import DropboxOAuth2Flow  
+from cloudutils_config import * 
+from oauth2client.client import OAuth2WebServerFlow
+from datetime import datetime
 
 class CloudServiceFactory(object):
     def get_fs(self, uri, user=None, callback_url=None, request = None):
@@ -16,7 +17,7 @@ class CloudServiceFactory(object):
         if(service_name == 'dropbox'):
             filesystem = self._build_dropbox_fs(user, credentials, root, callback_url, request)
         elif(service_name == 'google_drive'):
-            filesystem = GoogleDriveFS(None, credentials)
+            filesystem = self._build_google_drive_fs(user, credentials, root, callback_url, request)
         elif(service_name == 'sky_drive'):
             filesystem = SkyDriveFS(None, credentials)
         
@@ -45,10 +46,11 @@ class CloudServiceFactory(object):
         elif(request != None):
             try:
                 access_token, uid, url_state = dropbox.client.DropboxOAuth2Flow(
-                    CFG_DROPBOX_KEY, 
-                    CFG_DROPBOX_SECRET, callback_url, self.session, 
-                    CFG_DROPBOX_CSRF_TOKEN
-                    ).finish( request )
+                                                        CFG_DROPBOX_KEY, 
+                                                        CFG_DROPBOX_SECRET, 
+                                                        callback_url, self.session, 
+                                                        CFG_DROPBOX_CSRF_TOKEN
+                                                        ).finish( request )
             except Exception, e:
                 return None
     
@@ -64,6 +66,48 @@ class CloudServiceFactory(object):
             return filesystem
     
     
+    
+    def _build_google_drive_fs(self, user, credentials, root=None, callback_url=None, request=None):
+        if(request == None ):
+            try:
+                filesystem = GoogleDriveFS(root, credentials)
+                filesystem.about()
+                return filesystem
+            except:
+                #Remove everything from user credentials
+                #Session nije ovo
+                flow = OAuth2WebServerFlow(CFG_GOOGLE_DRIVE_CLIENT_ID, 
+                                           CFG_GOOGLE_DRIVE_CLIENT_SECRET, 
+                                           CFG_GOOGLE_DRIVE_SCOPE,
+                                           callback_url)
+                url = flow.step1_get_authorize_url()
+                return url
+          
+        elif(request != None):
+            try:
+                flow = OAuth2WebServerFlow(CFG_GOOGLE_DRIVE_CLIENT_ID, 
+                                           CFG_GOOGLE_DRIVE_CLIENT_SECRET, 
+                                           CFG_GOOGLE_DRIVE_SCOPE,
+                                           callback_url)
+                credentials_new = flow.step2_exchange( request )
+            except Exception, e:
+                return e
+
+        
+            newData = {
+                'google_drive': {
+                    'access_token': credentials_new.access_token,
+                    'client_id': credentials_new.client_id,
+                    'client_secret': credentials_new.client_secret,
+                    'refresh_token': credentials_new.refresh_token,
+                    'token_expiry': datetime.strftime(credentials_new.token_expiry, "%Y, %m, %d, %H, %M, %S, %f" ),
+                    'token_uri': credentials_new.token_uri,
+                    'user_agent': credentials_new.user_agent
+                }
+            }
+            
+            filesystem = GoogleDriveFS(root, newData.get("google_drive"))
+            return filesystem
     
     
 """    

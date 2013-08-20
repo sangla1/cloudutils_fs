@@ -306,6 +306,8 @@ class GoogleDriveFS(FS):
         self.cached_files = {}
         self._cacheing = caching
         
+        
+        
         def _getDateTimeFromString(time):
             if time:
                 return datetime.datetime.strptime( time, "%Y, %m, %d, %H, %M, %S, %f" )
@@ -344,10 +346,9 @@ class GoogleDriveFS(FS):
         
         self.client = GoogleDriveClient(self._credentials)
                 
-        if (self._root == None):
+        if (self._root == None or root == ''):
             about = self.client.about()
             self._root = about.get("rootFolderId")
-            
         super(GoogleDriveFS, self).__init__(thread_synchronize=thread_synchronize)
 
         
@@ -678,7 +679,7 @@ class GoogleDriveFS(FS):
         """
         
         path = self._normpath(path)
-        return self.client.metadata(path)
+        return self._metadata_to_info(self.client.metadata(path))
         
     
     def getpathurl(self, path, allow_none=False):
@@ -727,6 +728,19 @@ class GoogleDriveFS(FS):
         
         return path
     
+    def _metadata_to_info(self, metadata, localtime=False):
+        isdir = metadata["mimeType"] == "application/vnd.google-apps.folder"
+        info = {
+            'size': metadata.pop('fileSize', 0),
+            'isdir': isdir,
+            'title': metadata.pop('title', 0),
+            'created_time': metadata.pop('createdDate', 0),
+            'mime_type': metadata.pop('mime_type', 0)
+        }
+        
+        info.update(metadata)
+        
+        return info
     
 """
 Problems:

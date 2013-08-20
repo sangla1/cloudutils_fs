@@ -225,31 +225,7 @@ class DropboxClient(client.DropboxClient):
 
 
 
-def metadata_to_info(metadata, localtime=False):
-    isdir = metadata.pop('is_dir', False)
-    info = {
-        'size': metadata.pop('bytes', 0),
-        'isdir': isdir,
-        'isfile': not isdir,
-        'revision': metadata.pop('revision', 0),
-        'path': metadata.pop('path', 0),
-        'mime_type': metadata.pop('mime_type', 0)
-    }
-    try:
-        mtime = metadata.pop('modified', None)
-        if mtime:
-            # Parse date/time from Dropbox as struct_time.
-            mtime = time.strptime(mtime, TIME_FORMAT)
-            if localtime:
-                # Convert time to local timezone in seconds.
-                mtime = calendar.timegm(mtime)
-            else:
-                mtime = time.mktime(mtime)
-            # Convert to datetime object, store in modified_time
-            info['modified_time'] = datetime.datetime.fromtimestamp(mtime)
-    except KeyError:
-        pass
-    return info
+
 
 
 class DropboxFS(FS):
@@ -382,7 +358,7 @@ class DropboxFS(FS):
     def getinfo(self, path):
         path = abspath(normpath(path))
         metadata = self.client.metadata(path)
-        return metadata_to_info(metadata, localtime=self.localtime)
+        return self._metadata_to_info(metadata, localtime=self.localtime)
 
     def copy(self, src, dst, *args, **kwargs):
         src = abspath(normpath(src))
@@ -462,4 +438,32 @@ class DropboxFS(FS):
         elif( recursive ):
             return True
         else:
-            return False    
+            return False  
+          
+    def _metadata_to_info(self, metadata, localtime=False):
+        isdir = metadata.pop('is_dir', False)
+        info = {
+            'size': metadata.pop('bytes', 0),
+            'isdir': isdir,
+            'revision': metadata.pop('revision', 0),
+            'path': metadata.pop('path', 0),
+            'title': metadata.pop('path').split("/")[-1],
+            'mime_type': metadata.pop('mime_type', 0)
+        }
+        try:
+            mtime = metadata.pop('modified', None)
+            if mtime:
+                # Parse date/time from Dropbox as struct_time.
+                mtime = time.strptime(mtime, TIME_FORMAT)
+                if localtime:
+                    # Convert time to local timezone in seconds.
+                    mtime = calendar.timegm(mtime)
+                else:
+                    mtime = time.mktime(mtime)
+                # Convert to datetime object, store in modified_time
+                info['modified_time'] = datetime.datetime.fromtimestamp(mtime)
+        except KeyError:
+            pass
+        
+        info.update(metadata)
+        return info
