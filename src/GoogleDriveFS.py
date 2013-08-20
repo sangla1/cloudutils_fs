@@ -1,6 +1,4 @@
 import six
-from StringIO import StringIO
-import mimetypes
 import os
 import datetime
 import time
@@ -21,12 +19,9 @@ from apiclient.discovery import build
 from apiclient.http import MediaInMemoryUpload
 from oauth2client.client import OAuth2Credentials
 from apiclient import errors
-import simplejson
 
 # Items in cache are considered expired after 5 minutes.
 CACHE_TTL = 300
-# The format Dropbox uses for times.
-TIME_FORMAT = '%a, %d %b %Y %H:%M:%S +0000'
 # Max size for spooling to memory before using disk (5M).
 MAX_BUFFER = 1024**2*5
 
@@ -86,27 +81,28 @@ class GoogleDriveClient(object):
         return service
     
     def get_file(self, file_id):
+        metadata = None
+        
         if( not self.cache.get(file_id, None) ):
             try: 
-                f = self.service.files().get(fileId=file_id).execute()
+                metadata = self.service.files().get(fileId=file_id).execute()
             except errors.HttpError, e:
                 if e.resp.status == 404:
                     raise ResourceNotFoundError("Source file doesn't exist")
                 
                 raise OperationFailedError(opname='get_file', msg= e.resp.reason )
             
-            self.cache.set(f["id"], f)
-            download_url = f.get('downloadUrl')
-            resp, content = self.service._http.request(download_url)
+            self.cache.set(metadata['id'], metadata)
+        else:
+            item = self.cache[file_id]
+            metadata = item.metadata
+            
+        download_url = metadata.get('downloadUrl')
+        resp, content = self.service._http.request(download_url)
+        if( resp.status == 200 ):
             return content
         else:
-            f = self.cache[file_id]
-            download_url = f.metadata.get('downloadUrl')
-            resp, content = self.service._http.request(download_url)
-            if( resp.status == 200 ):
-                return content
-            else:
-                raise OperationFailedError(opname="get_file", msg=str(resp))  
+            raise OperationFailedError(opname="get_file", msg=str(resp))  
         
         
     def metadata(self, path):
@@ -158,10 +154,12 @@ class GoogleDriveClient(object):
                     self.cache[child['id']] = CacheItem(child)
                 item = self.cache[path] = CacheItem(metadata, children)
             except errors.HttpError, e:
+                if e.resp.status == 404:
+                    raise ResourceNotFoundError(path)
                 if not item or e.resp.status != 304:
                     raise OperationFailedError(opname='metadata',path=path, msg=e.resp.reason )
                 # We have an item from cache (perhaps expired), but it's
-                # hash is still valid (as far as Dropbox is concerned),
+                # hash is still valid (as far as GoogleDrive is concerned),
                 # so just renew it and keep using it.
                 item.renew()
         return item.children
@@ -176,6 +174,10 @@ class GoogleDriveClient(object):
         try:
             metadata = self.service.files().insert(body=body).execute()
         except errors.HttpError, e:
+            if e.resp.status == 405:
+                    raise ResourceInvalidError(parent_id)
+            if e.resp.status == 404:
+                    raise ResourceNotFoundError(parent_id)
             raise OperationFailedError(opname='file_create_folder', msg=e.resp.reason + \
                                        ", the reasons could be: parent doesn't exist or is a file" )
             
@@ -216,12 +218,13 @@ class GoogleDriveClient(object):
     
     def update_file_content(self, file_id, content):
         # Updates a file on google drive
-        f = self.cache.get(file_id, None)
-        if( f == None ):
+        item = self.cache.get(file_id, None)
+        if( item == None ):
             metadata = self.service.files().get(fileId=file_id).execute()
             self.cache.set(file_id, metadata)
         else:
-            metadata = f.metadata    
+            metadata = item.metadata    
+            
         media_body = MediaInMemoryUpload(content)
         try: 
             updated_file = self.service.files().update(
@@ -294,13 +297,12 @@ class GoogleDriveFS(FS):
               'atomic.move' : True,
               'atomic.copy' : True,
               'atomic.makedir' : True,
-              'atomic.rename' : False,
+              'atomic.rename' : True,
               'atomic.setconetns' : True
               }
 
     def __init__(self, root=None, credentials=None, thread_synchronize=True, caching=False):
         self._root = root
-        self._credentials = credentials
         self.cached_files = {}
         self._cacheing = caching
         
@@ -310,7 +312,7 @@ class GoogleDriveFS(FS):
             else:
                 return None            
         
-        if( self._credentials == None ):
+        if( credentials == None ):
             if( "GD_ACCESS_TOKEN" not in os.environ or
                 "GD_CLIENT_ID" not in os.environ or
                 "GD_CLIENT_SECRET" not in os.environ or
@@ -320,7 +322,7 @@ class GoogleDriveFS(FS):
                                          "GD_ACCESS_TOKEN, GD_CLIENT_ID, GD_CLIENT_SECRET" + \
                                          " GD_TOKEN_EXPIRY, GD_TOKEN_URI in os.environ")
             else:
-                credentials = OAuth2Credentials(
+                self._credentials = OAuth2Credentials(
                                 os.environ.get('GD_ACCESS_TOKEN'), 
                                 os.environ.get('GD_CLIENT_ID'), 
                                 os.environ.get('GD_CLIENT_SECRET'), 
@@ -329,9 +331,18 @@ class GoogleDriveFS(FS):
                                 os.environ.get('GD_TOKEN_URI'), 
                                 None
                                 )
+        else:
+            self._credentials = OAuth2Credentials(
+                                        credentials.get('access_token'), 
+                                        credentials.get('client_id'), 
+                                        credentials.get('client_secret'), 
+                                        credentials.get('refresh_token'), 
+                                        _getDateTimeFromString( credentials.get('token_expiry') ),
+                                        credentials.get('token_uri'), 
+                                        None
+                                        )
         
-        
-        self.client = GoogleDriveClient(credentials)
+        self.client = GoogleDriveClient(self._credentials)
                 
         if (self._root == None):
             about = self.client.about()
@@ -383,7 +394,6 @@ class GoogleDriveFS(FS):
         @param chunk_size: Number of bytes to read in a chunk, if the implementation has to resort to a read / 
             copy loop 
         """
-        path = self._normpath(path)
          
         encoding = kwargs.get("encoding", None)
         errors = kwargs.get("errors", None)
@@ -415,7 +425,7 @@ class GoogleDriveFS(FS):
             parent_id = parts[0]
             title = parts[1]
             if( not self.exists(parent_id) ):
-                raise PathError("parent doesn't exist")
+                raise PathError("parent with the id '%s' doesn't exist" % parent_id)
         else:
             parent_id = self._root
             title = parts[0]
@@ -498,6 +508,7 @@ class GoogleDriveFS(FS):
         @param path: id of the folder to be deleted
         @return: None if removal was successful 
         """
+        path = self._normpath(path)
         
         if self.is_root(path = path):
             raise UnsupportedError("Can't remove the root directory")   
@@ -511,6 +522,8 @@ class GoogleDriveFS(FS):
         @param path: id of the folder to be deleted
         @return: None if removal was successful 
         """        
+        path = self._normpath(path)
+        
         if not self.isdir(path):
             raise PathError("Specified path is a directory") 
         if self.is_root(path = path):
@@ -656,10 +669,6 @@ class GoogleDriveFS(FS):
                                           dirs_only=dirs_only,
                                           files_only=files_only)]
 
-        
-        
-
-            
 
     def getinfo(self, path):
         """
@@ -667,17 +676,13 @@ class GoogleDriveFS(FS):
         @return: dictionary with informations about the specific file 
         @raise PathError: if the provided path doesn't exist 
         """
+        
         path = self._normpath(path)
-        resp = self.client.metadata(path)
-        return resp
+        return self.client.metadata(path)
         
     
     def getpathurl(self, path, allow_none=False):
         """Returns a url that corresponds to the given path, if one exists.
-        
-        If the path does not have an equivalent URL form (and allow_none is False)
-        then a :class:`~fs.errors.NoPathURLError` exception is thrown. Otherwise the URL will be
-        returns as an unicode string.
         
         @param path: id of the file for which to return the url path
         @param allow_none: if true, this method can return None if there is no
@@ -701,16 +706,23 @@ class GoogleDriveFS(FS):
    
     def desc(self, path):
         path = self._normpath(path)
-        return self.getinfo(path)["title"]
+        info = self.getinfo(path)
+        return info["title"]
+    
+    def about(self):
+        return self.client.about() 
     
     def _normpath(self, path):
-        if(path[0] == "/" and len(path) == 1):
+        
+        if(path == None):
+            return self._root
+        elif( len( path.split("/") ) > 2 ):
+            return path.split("/")[-1]
+        elif(path[0] == "/" and len(path) == 1):
             return self._root
         elif(path[0] == "/"):
             return path[1:]
         elif(len(path) == 0):
-            return self._root
-        elif(path == None):
             return self._root
         
         return path

@@ -281,8 +281,12 @@ class DropboxFS(FS):
         self.client = DropboxClient( oauth2_access_token = self._credentials['access_token'] )
         self.localtime = localtime
 
-    def __str__(self):
-        return "<DropboxFS: %s>" % self._root
+    def __repr__(self):
+        args = (self.__class__.__name__, self._root)
+        
+        return '< FileSystem: %s - Root Directory: %s >' % args
+
+    __str__ = __repr__
 
     def __unicode__(self):
         return u"<DropboxFS: %s>" % self._root
@@ -441,7 +445,9 @@ class DropboxFS(FS):
     def getpathurl(self, path):
         path = abspath(normpath(path))
         return self.client.media(path)
-        
+    
+    def about(self):
+        return self.client.account_info()    
     
     def _checkRecursive(self, recursive, path):
         #  Checks if the new folder to be created is compatible with current
